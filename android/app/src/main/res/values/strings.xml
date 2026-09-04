@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MaxCam VCam</string>
+    <string name="hint_ip">Max PC IP</string>
+    <string name="hint_port">Port</string>
+    <string name="btn_connect">Connect</string>
+    <string name="btn_disconnect">Disconnect</string>
+    <string name="btn_recenter">Recenter</string>
+    <string name="btn_record">Record</string>
+    <string name="status_idle">Idle</string>
+    <string name="status_tracking">Tracking</string>
+    <string name="status_not_tracking">Not tracking</string>
+</resources>
