@@ -13,6 +13,9 @@ android/.cxx/
 max/__pycache__/
 *.pyc
 
+# Built APKs at the repo root (built for a GitHub Release, not tracked in git)
+/*.apk
+
 # OS / editor
 .DS_Store
 Thumbs.db
