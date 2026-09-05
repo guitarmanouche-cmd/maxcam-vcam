@@ -69,24 +69,50 @@ class MainActivity : ComponentActivity(), ArCameraRenderer.PoseListener {
         binding.connectButton.setOnClickListener { onConnectClicked() }
         binding.recenterButton.setOnClickListener { recenterRequested.set(true) }
         binding.recordToggle.setOnCheckedChangeListener { _, checked -> isRecording = checked }
+
+        loadSavedConnection()
+    }
+
+    /** IP/port typed once, then remembered — otherwise every phone sleep (screen timeout kills
+     * the UDP socket, see UdpCameraSender) meant retyping the PC's IP by hand. */
+    private fun loadSavedConnection() {
+        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        prefs.getString(PREF_KEY_IP, null)?.let { binding.ipInput.setText(it) }
+        val savedPort = prefs.getInt(PREF_KEY_PORT, -1)
+        if (savedPort > 0) {
+            binding.portInput.setText(savedPort.toString())
+        }
+    }
+
+    private fun saveConnection(host: String, port: Int) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+            .putString(PREF_KEY_IP, host)
+            .putInt(PREF_KEY_PORT, port)
+            .apply()
     }
 
     private fun onConnectClicked() {
+        Log.d(TAG, "connect button clicked, currently connected=${sender.isConnected}")
         if (sender.isConnected) {
             sender.disconnect()
             binding.connectButton.setText(R.string.btn_connect)
+            Toast.makeText(this, "Disconnected", Toast.LENGTH_SHORT).show()
             return
         }
         val host = binding.ipInput.text.toString().trim()
         val port = binding.portInput.text.toString().trim().toIntOrNull()
         if (host.isEmpty() || port == null) {
+            Log.w(TAG, "connect aborted: bad input host='$host' port='${binding.portInput.text}'")
             Toast.makeText(this, "Enter a valid IP and port", Toast.LENGTH_SHORT).show()
             return
         }
         try {
             sender.connect(host, port)
+            saveConnection(host, port)
             binding.connectButton.setText(R.string.btn_disconnect)
+            Toast.makeText(this, "Connected to $host:$port", Toast.LENGTH_SHORT).show()
         } catch (e: IOException) {
+            Log.e(TAG, "connect failed", e)
             Toast.makeText(this, "Connect failed: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
@@ -227,5 +253,8 @@ class MainActivity : ComponentActivity(), ArCameraRenderer.PoseListener {
 
     companion object {
         private const val TAG = "MaxCamVCam"
+        private const val PREFS_NAME = "maxcam_vcam_prefs"
+        private const val PREF_KEY_IP = "server_ip"
+        private const val PREF_KEY_PORT = "server_port"
     }
 }

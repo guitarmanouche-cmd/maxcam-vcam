@@ -21,6 +21,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 import pymxs
 
@@ -36,38 +37,89 @@ rt = pymxs.runtime
 
 UDP_HOST = "0.0.0.0"
 UDP_PORT = 40111                  # must match the port entered in the Android app
-CAMERA_NAME = "PhoneCam"          # Free Camera object the server drives (auto-created if missing)
-SCENE_SCALE = 1.0                 # multiply incoming meters by this to match the scene's system units
-POLL_INTERVAL_MS = 16             # ~60 Hz main-thread apply rate
+CAMERA_NAME = "PhoneCam"          # live-preview Free Camera (auto-created if missing) — NEVER keyed, see below
+TAKE_CAMERA_NAME = "PhoneCam_Take"  # separate camera that recording bakes keys onto — NEVER live-set, see below
+SCENE_SCALE = 100.0                # meters -> scene units; this scene's system units are centimeters
+POLL_INTERVAL_MS = 33             # ~30 Hz main-thread apply rate — plenty for a live operator preview
 SMOOTHING_ALPHA = 1.0             # 1.0 = no smoothing; lower = smoother but laggier
 
 
 # --- coordinate remap: ARCore (right-handed, Y-up) -> Max (right-handed, Z-up) ---
+#
+# Verified empirically on-device 2026-09-04 by probing a fresh identity-
+# transform Freecamera in a live Max session (create it, place marker boxes
+# on each world axis, capture what the camera actually sees): an identity
+# Max camera looks down world **-Z** with local Y as "up" and local X as
+# "right" — i.e. structurally the *same* role layout as ARCore/OpenGL
+# (right=local X, up=local Y, backward=local Z), not the "-Y forward"
+# convention commonly quoted for Max cameras. So this only needs the
+# world-basis remap (Y-up -> Z-up) applied identically to every row —
+# no local-axis role swap.
+#
+# A row-swap was tried first (based on the "-Y forward" assumption) and
+# produced an upside-down camera: swapping which source row feeds a
+# destination row is an odd permutation (determinant -1, a mirror), which
+# is a strictly worse failure mode than a sign error — don't reintroduce it
+# without re-verifying the identity-camera direction the way this comment
+# describes.
 
 def _remap_vec(v):
-    """TODO calibrate against the real device — verify forward/up match before trusting this."""
     x, y, z = v
     return (x, -z, y)
 
 
+def _normalize_quat(quat):
+    qx, qy, qz, qw = quat
+    mag = (qx * qx + qy * qy + qz * qz + qw * qw) ** 0.5
+    if mag > 0:
+        return (qx / mag, qy / mag, qz / mag, qw / mag)
+    return (0.0, 0.0, 0.0, 1.0)
+
+
 def _ar_pose_to_max_matrix(pos, quat, scale):
-    q = rt.quat(quat[0], quat[1], quat[2], quat[3])
+    # Conjugate (x,y,z negated, w kept): reported on-device 2026-09-04 that
+    # pitch and yaw both came out inverted (tilt down -> Max tilts up, yaw
+    # CW -> Max yaws CCW) with the axis roles otherwise correct — the
+    # signature of MAXScript's quat->matrix rotation sense being opposite
+    # ARCore's, not a per-axis sign or role bug. If this overcorrects
+    # (everything now backwards the other way), revert to the plain
+    # quaternion; if it's still off on one axis only, this isn't the right
+    # explanation and _remap_vec/the row assignment need another look.
+    #
+    # Normalize defensively before building the matrix: a non-unit
+    # quaternion isn't guaranteed to just come out as a uniform scale once
+    # run through rotate() — depending on the internal formula it can shear
+    # the result — and this is cheap insurance against that regardless of
+    # how much it actually contributed to the 2026-09-05 squashing (float32
+    # from ARCore is only ~1e-7 off unit length, nowhere near enough on its
+    # own to explain the ~2-7x stretch that was observed).
+    qx, qy, qz, qw = _normalize_quat(quat)
+    q = rt.quat(-qx, -qy, -qz, qw)
     ar_rot = rt.rotate(rt.matrix3(1), q)
 
     def _row(p):
         return _remap_vec((p.x, p.y, p.z))
 
-    r1 = _row(ar_rot.row1)
-    r2 = _row(ar_rot.row2)
-    r3 = _row(ar_rot.row3)
+    right = _row(ar_rot.row1)     # ARCore local X (right)    -> Max local X (right)
+    up = _row(ar_rot.row2)        # ARCore local Y (up)       -> Max local Y (up)
+    backward = _row(ar_rot.row3)  # ARCore local Z (backward) -> Max local Z (backward)
     tx, ty, tz = _remap_vec(pos)
 
     return rt.matrix3(
-        rt.point3(*r1),
-        rt.point3(*r2),
-        rt.point3(*r3),
+        rt.point3(*right),
+        rt.point3(*up),
+        rt.point3(*backward),
         rt.point3(tx * scale, ty * scale, tz * scale),
     )
+
+
+def _reset_scale(cam):
+    """Force uniform scale back to 1. A camera should never need scale, but
+    setting `.transform` from three basis rows lets tiny non-orthonormal
+    drift (or, previously, a bad key elsewhere on the timeline interpolating
+    across a huge range) show up as a stretched/squashed camera — reported
+    on-device 2026-09-04. Cheap insurance regardless of root cause."""
+    cam.scale = rt.point3(1, 1, 1)
 
 
 # --- server ----------------------------------------------------------------
@@ -91,6 +143,12 @@ class MaxCamServer:
 
         self._timer = None
 
+        # -- recording state (see _update_recording) --
+        self._recording = False
+        self._record_start_wall = None
+        self._record_start_frame = 0
+        self._last_recorded_frame = None
+
     # -- lifecycle --
 
     def start(self):
@@ -98,7 +156,7 @@ class MaxCamServer:
             print("[MaxCamServer] already running")
             return
 
-        self._ensure_camera()
+        self._ensure_camera(self.camera_name)
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -126,12 +184,31 @@ class MaxCamServer:
         self._stop_timer()
         print("[MaxCamServer] stopped")
 
-    def _ensure_camera(self):
-        cam = rt.getNodeByName(self.camera_name)
+    def _ensure_camera(self, name):
+        cam = rt.getNodeByName(name)
         if cam is None:
             cam = rt.Freecamera()
-            cam.name = self.camera_name
-            print(f"[MaxCamServer] created Free Camera '{self.camera_name}'")
+            cam.name = name
+            print(f"[MaxCamServer] created Free Camera '{name}'")
+
+        # Default rotation controller is Euler XYZ, which Autodesk's own
+        # docs say "does not allow rotations of greater than 180 degrees
+        # between keys" — two keys with nearly identical real orientation
+        # can land on very different Euler triples, so playback
+        # flips/judders every frame (worst near straight up/down).
+        # Reported on-device 2026-09-04 as the camera alternating
+        # look-up/look-down each frame during playback. Autodesk's docs
+        # recommend TCB specifically "for continuous rotation" — force it
+        # once, up front. Compare class names as strings: classOf(...) ==
+        # rt.TCB_rotation silently never matched through the pymxs wrapper,
+        # which is why this didn't stick the first time.
+        try:
+            current_class = str(rt.classOf(cam.rotation.controller))
+            if current_class.lower() != "tcb_rotation":
+                cam.rotation.controller = rt.TCB_rotation()
+        except Exception as e:
+            print(f"[MaxCamServer] could not set TCB_rotation controller: {e}")
+
         return cam
 
     # -- network thread: only touches the socket and the shared queue slot --
@@ -181,7 +258,86 @@ class MaxCamServer:
             return  # camera deleted/renamed; keep listening in case it reappears
 
         pos, quat = self._smooth(packet.pos, packet.quat)
-        cam.transform = _ar_pose_to_max_matrix(pos, quat, SCENE_SCALE)
+        new_transform = _ar_pose_to_max_matrix(pos, quat, SCENE_SCALE)
+        # Undo recording on every transform set at 30-60 Hz is what made the
+        # camera viewport crawl (reported ~2 fps 2026-09-04) — this is a
+        # live preview, not something the operator needs to Ctrl+Z through.
+        #
+        # cam (CAMERA_NAME/PhoneCam) must NEVER receive keys — confirmed
+        # live 2026-09-05: assigning a value to an already-keyed property
+        # outside animate mode does NOT just preview the current time, it
+        # SHIFTS EVERY EXISTING KEY by the delta needed to match the new
+        # value (tested on a plain Point: two keys 0->[0,0,0], 10->[100,0,0],
+        # parked at frame 5 (interpolated [50,0,0]), set .pos=[999,0,0] with
+        # animate off -> key@0 became [949,0,0], key@10 became [1049,0,0] —
+        # both keys shifted by the same +949 delta). That's what was
+        # actually squashing/juddering the camera: once it had ANY keys
+        # (from a take), every live tick below re-shifted the WHOLE curve,
+        # scale included, since assigning .transform touches Position/
+        # Rotation/Scale together. The recorded take now lives on a
+        # completely separate object (TAKE_CAMERA_NAME/PhoneCam_Take,
+        # below) that this live path never touches, so it can't happen here.
+        with pymxs.undo(False):
+            cam.transform = new_transform
+            _reset_scale(cam)
+
+        self._update_recording(packet.is_recording, new_transform)
+
+    def _update_recording(self, is_recording, transform):
+        """Bakes real keyframes onto TAKE_CAMERA_NAME (a camera separate
+        from the live-preview one — see the comment in _apply_latest for
+        why they can't be the same object) while the phone's Record button
+        is held. Tracks wall-clock time since Record was pressed, converts
+        it to a frame number via the scene's frame rate, and sets a key
+        there each time it reaches a new frame — so stopping and scrubbing
+        the timeline plays back the take at the speed it was performed.
+        """
+        if not is_recording:
+            if self._recording:
+                print(f"[MaxCamServer] recording stopped at frame {self._last_recorded_frame}")
+            self._recording = False
+            return
+
+        if not self._recording:
+            self._recording = True
+            self._record_start_wall = time.time()
+            self._record_start_frame = int(rt.currentTime) // int(rt.ticksperframe)
+            self._last_recorded_frame = None
+            self._ensure_camera(TAKE_CAMERA_NAME)  # create + fix its rotation controller once, up front
+            print(f"[MaxCamServer] recording started at frame {self._record_start_frame}")
+
+        take_cam = rt.getNodeByName(TAKE_CAMERA_NAME)
+        if take_cam is None:
+            return  # take camera deleted mid-recording; keep listening in case it reappears
+
+        elapsed = time.time() - self._record_start_wall
+        frame = self._record_start_frame + round(elapsed * rt.frameRate)
+        if frame == self._last_recorded_frame:
+            return  # scene frame rate < packet rate; nothing new to key yet
+        self._last_recorded_frame = frame
+
+        # Construct an explicit frame-suffixed time value ("42f") via
+        # rt.execute rather than passing a bare number or a hand-multiplied
+        # tick count — bare numbers passed to interval()/attime() are
+        # ambiguous (confirmed live: `interval 0 100` produced a 100-FRAME
+        # range, i.e. 16000 ticks, so bare ints mean frames there), and
+        # frame*ticksperframe passed to attime() turned out to want the
+        # same frame-based value, not ticks — that mismatch was what made
+        # the scene's actual current time lurch ~160x too far forward every
+        # tick while Record was held, which is what caused the real-time
+        # squashing/juddering (reported on-device 2026-09-04/09-05). The "f"
+        # suffix sidesteps needing to know which interpretation applies.
+        frame_time = rt.execute(f"{frame}f")
+
+        end_frame = int(rt.animationRange.end) // int(rt.ticksperframe)
+        if frame > end_frame:
+            rt.animationRange = rt.interval(rt.animationRange.start, frame_time)
+
+        with pymxs.undo(False):
+            with pymxs.attime(frame_time):
+                with pymxs.animate(True):
+                    take_cam.transform = transform
+                    _reset_scale(take_cam)
 
     def _smooth(self, pos, quat):
         a = SMOOTHING_ALPHA
@@ -194,8 +350,13 @@ class MaxCamServer:
         new_pos = tuple(sp[i] + a * (pos[i] - sp[i]) for i in range(3))
         # Linear (not spherical) blend on the quaternion — fine close to
         # alpha=1 / at high poll rates; switch to slerp if jitter shows up
-        # at lower alpha.
-        new_quat = tuple(sq[i] + a * (quat[i] - sq[i]) for i in range(4))
+        # at lower alpha. LERP between two unit quaternions shortens the
+        # result (it's a chord, not an arc), and since self._smoothed_quat
+        # feeds back in as next tick's starting point, an un-renormalized
+        # result would shrink further every tick alpha<1 is used — so
+        # renormalize what gets stored, not just what _ar_pose_to_max_matrix
+        # consumes downstream.
+        new_quat = _normalize_quat(tuple(sq[i] + a * (quat[i] - sq[i]) for i in range(4)))
         self._smoothed_pos, self._smoothed_quat = new_pos, new_quat
         return new_pos, new_quat
 
