@@ -11,6 +11,13 @@ Re-running the script stops any server it previously started (tracked via
 the `builtins` module, which survives re-execution within the same Max
 session), so it's safe to just hit Run Script again after editing.
 
+IMPORTANT: use Scripting > Run Script... (the file-picker) or
+python.ExecuteFile with a path, NOT a script-editor tab's Evaluate/Ctrl+E —
+an editor tab holds whatever text was in it when you opened it, which can
+be stale if the file changed on disk since. Every run prints
+"[MaxCamServer] script version <SCRIPT_VERSION>" — if that doesn't match
+the version below, you're not running what you think you're running.
+
 See docs/PROTOCOL.md for the wire format and the coordinate-system caveat —
 the ARCore -> Max axis remap below is a starting point, not calibrated
 against a real device yet.
@@ -32,6 +39,8 @@ if _THIS_DIR not in sys.path:
 import protocol  # noqa: E402
 
 rt = pymxs.runtime
+
+SCRIPT_VERSION = "2026-09-05-rt-execute-fix"  # bump this string whenever you edit this file
 
 # --- configuration -------------------------------------------------------
 
@@ -168,6 +177,7 @@ class MaxCamServer:
         self._recv_thread.start()
 
         self._start_timer()
+        print(f"[MaxCamServer] script version {SCRIPT_VERSION}")
         print(f"[MaxCamServer] listening on {self.host}:{self.port}, driving camera '{self.camera_name}'")
 
     def stop(self):
@@ -199,15 +209,32 @@ class MaxCamServer:
         # Reported on-device 2026-09-04 as the camera alternating
         # look-up/look-down each frame during playback. Autodesk's docs
         # recommend TCB specifically "for continuous rotation" — force it
-        # once, up front. Compare class names as strings: classOf(...) ==
-        # rt.TCB_rotation silently never matched through the pymxs wrapper,
-        # which is why this didn't stick the first time.
+        # once, up front.
+        #
+        # `cam.rotation.controller` (attribute-chaining) throws through
+        # pymxs on a node — confirmed on-device 2026-09-05:
+        # "'MXSWrapperBase' object has no attribute 'controller'" — even
+        # though the exact same expression works fine typed directly into
+        # the MAXScript listener, and getPropertyController/
+        # setPropertyController (tried as a fix) turned out to be the wrong
+        # functions entirely (returned UndefinedClass even from pure
+        # MAXScript — they're for something else). This is a pymxs Python-
+        # bridge gap, not a MAXScript one. Worse, the same attribute
+        # pattern was used — and its exception silently swallowed — in the
+        # key-clearing code below, which is why old takes were never
+        # actually being deleted. Fix: do the whole thing as one MAXScript
+        # string via rt.execute(), which isn't subject to pymxs's attribute
+        # forwarding at all; look the node up by name again inside it
+        # rather than trying to pass the pymxs object in.
         try:
-            current_class = str(rt.classOf(cam.rotation.controller))
-            if current_class.lower() != "tcb_rotation":
-                cam.rotation.controller = rt.TCB_rotation()
+            result = rt.execute(
+                f'(local c = getNodeByName "{name}"; local cls = classOf c.rotation.controller as string; '
+                f'if cls != "TCB_rotation" then (c.rotation.controller = TCB_rotation(); cls + " -> TCB_rotation") '
+                f'else (cls + " (already TCB)"))'
+            )
+            print(f"[MaxCamServer] '{name}' rotation controller: {result}")
         except Exception as e:
-            print(f"[MaxCamServer] could not set TCB_rotation controller: {e}")
+            print(f"[MaxCamServer] could not set TCB_rotation controller on '{name}': {e}")
 
         return cam
 
@@ -303,7 +330,34 @@ class MaxCamServer:
             self._record_start_wall = time.time()
             self._record_start_frame = int(rt.currentTime) // int(rt.ticksperframe)
             self._last_recorded_frame = None
-            self._ensure_camera(TAKE_CAMERA_NAME)  # create + fix its rotation controller once, up front
+            take_cam = self._ensure_camera(TAKE_CAMERA_NAME)  # create + fix its rotation controller once, up front
+
+            # Wipe any keys from a previous take before laying down new
+            # ones. Without this, starting a second take (e.g. after
+            # rewinding to frame 0) leaves the old take's keys sitting in
+            # the same range as the new one, and the two interleave/fight
+            # instead of the new take cleanly replacing the old — reported
+            # on-device 2026-09-05. If a take is worth keeping, copy the
+            # camera object out before recording over it again.
+            # Same pymxs attribute-chaining gap as in _ensure_camera —
+            # `take_cam.position.controller` throws through pymxs, and this
+            # exact spot silently ate that exception before (`except:
+            # pass`, no print), which is the actual reason old takes were
+            # never being cleared. Do it as one MAXScript string instead.
+            with pymxs.undo(False):
+                try:
+                    cleared = rt.execute(
+                        f'(local c = getNodeByName "{TAKE_CAMERA_NAME}"; local n = 0; '
+                        f'if (numKeys c.position.controller) > 0 then (deleteKeys c.position.controller #allKeys; n += 1); '
+                        f'if (numKeys c.rotation.controller) > 0 then (deleteKeys c.rotation.controller #allKeys; n += 1); '
+                        f'if (numKeys c.scale.controller) > 0 then (deleteKeys c.scale.controller #allKeys; n += 1); '
+                        f'n)'
+                    )
+                    if cleared:
+                        print(f"[MaxCamServer] cleared previous take's keys on '{TAKE_CAMERA_NAME}' ({cleared} controllers)")
+                except Exception as e:
+                    print(f"[MaxCamServer] could not clear previous take's keys on '{TAKE_CAMERA_NAME}': {e}")
+
             print(f"[MaxCamServer] recording started at frame {self._record_start_frame}")
 
         take_cam = rt.getNodeByName(TAKE_CAMERA_NAME)
