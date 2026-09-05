@@ -40,7 +40,7 @@ import protocol  # noqa: E402
 
 rt = pymxs.runtime
 
-SCRIPT_VERSION = "2026-09-05-rt-execute-fix"  # bump this string whenever you edit this file
+SCRIPT_VERSION = "2026-09-05-force-redraw"  # bump this string whenever you edit this file
 
 # --- configuration -------------------------------------------------------
 
@@ -49,7 +49,13 @@ UDP_PORT = 40111                  # must match the port entered in the Android a
 CAMERA_NAME = "PhoneCam"          # live-preview Free Camera (auto-created if missing) — NEVER keyed, see below
 TAKE_CAMERA_NAME = "PhoneCam_Take"  # separate camera that recording bakes keys onto — NEVER live-set, see below
 SCENE_SCALE = 100.0                # meters -> scene units; this scene's system units are centimeters
-POLL_INTERVAL_MS = 33             # ~30 Hz main-thread apply rate — plenty for a live operator preview
+POLL_INTERVAL_MS = 16             # ~60 Hz main-thread apply rate, matching the phone's actual send rate.
+                                   # Was 33 (~30 Hz) — throttled down to fight a "~2 fps viewport" bug that
+                                   # turned out to be Undo recording every transform set (now pymxs.undo(False)
+                                   # everywhere it matters), not the poll rate itself. At 33ms Max was only
+                                   # ever applying every other packet — confirmed live 2026-09-05 that the
+                                   # phone sends a steady ~60/sec with zero drops — which is what live preview
+                                   # showed as choppy/stepped motion instead of smooth.
 SMOOTHING_ALPHA = 1.0             # 1.0 = no smoothing; lower = smoother but laggier
 
 
@@ -157,6 +163,11 @@ class MaxCamServer:
         self._record_start_wall = None
         self._record_start_frame = 0
         self._last_recorded_frame = None
+
+        # -- perf instrumentation (see _apply_latest) --
+        self._perf_count = 0
+        self._perf_time_accum = 0.0
+        self._perf_last_log = time.time()
 
     # -- lifecycle --
 
@@ -280,6 +291,8 @@ class MaxCamServer:
             return
         self._latest_seq_applied = packet.seq
 
+        _perf_t0 = time.time()
+
         cam = rt.getNodeByName(self.camera_name)
         if cam is None:
             return  # camera deleted/renamed; keep listening in case it reappears
@@ -307,8 +320,34 @@ class MaxCamServer:
         with pymxs.undo(False):
             cam.transform = new_transform
             _reset_scale(cam)
+            # Setting .transform alone doesn't force an immediate repaint —
+            # confirmed on-device 2026-09-05: the data was updating at a
+            # clean ~57/sec with <1ms per apply (logged below), but the
+            # viewport still only visibly redrew a few times a second,
+            # while a plain MAXScript loop doing transform-set +
+            # forceCompleteRedraw() hit 182 fps on this same scene. Max's
+            # own implicit/idle-driven redraw was the actual bottleneck,
+            # not our data pipeline.
+            rt.forceCompleteRedraw()
 
         self._update_recording(packet.is_recording, new_transform)
+
+        # Perf instrumentation: isolate whether the choppiness is Max/
+        # viewport-side or in our own per-tick Python<->MAXScript overhead.
+        # A raw MAXScript loop (transform set + forceCompleteRedraw, no
+        # Python involved) hit 182 fps on this exact scene 2026-09-05, so if
+        # this logs anywhere near that, the bottleneck is elsewhere (Qt
+        # timer scheduling, viewport redraw not actually triggering off a
+        # plain property set the way forceCompleteRedraw does, etc).
+        self._perf_count += 1
+        self._perf_time_accum += time.time() - _perf_t0
+        now = time.time()
+        if now - self._perf_last_log >= 1.0:
+            avg_ms = (self._perf_time_accum / self._perf_count) * 1000.0 if self._perf_count else 0.0
+            print(f"[MaxCamServer] perf: {self._perf_count} applies/sec, {avg_ms:.1f} ms/apply avg")
+            self._perf_count = 0
+            self._perf_time_accum = 0.0
+            self._perf_last_log = now
 
     def _update_recording(self, is_recording, transform):
         """Bakes real keyframes onto TAKE_CAMERA_NAME (a camera separate
